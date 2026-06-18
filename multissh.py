@@ -9,6 +9,7 @@ Uso:
   multissh run --all "df -h"  # roda em todos os hosts
   multissh script deploy.sh   # envia e executa script
   multissh add                # cadastra novo host
+  multissh connect [NOME]     # abre sessão SSH interativa em um host
 """
 
 import json
@@ -16,6 +17,9 @@ import os
 import sys
 import threading
 import argparse
+import shlex
+import subprocess
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -126,16 +130,17 @@ def _connect(host_info: dict, timeout: int) -> paramiko.SSHClient:
     return client
 
 
-def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT) -> tuple:
+def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False) -> tuple:
     """Retorna (name, exit_code, stdout, stderr, elapsed_ms)."""
     t0 = time.monotonic()
     client = None
     try:
         client = _connect(info, timeout)
-        _, stdout, stderr = client.exec_command(command, timeout=timeout * 6)
+        _, stdout, stderr = client.exec_command(command, timeout=timeout * 6, get_pty=pty)
         code = stdout.channel.recv_exit_status()
         out  = stdout.read().decode("utf-8", errors="replace")
-        err  = stderr.read().decode("utf-8", errors="replace")
+        # Com PTY, stderr é mesclado no stdout pelo terminal
+        err  = "" if pty else stderr.read().decode("utf-8", errors="replace")
     except Exception as e:
         code, out, err = -1, "", str(e)
     finally:
@@ -144,7 +149,7 @@ def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT)
     return name, code, out, err, int((time.monotonic() - t0) * 1000)
 
 
-def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_TIMEOUT) -> tuple:
+def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False) -> tuple:
     """Envia e executa um script shell. Retorna (name, exit_code, stdout, stderr, elapsed_ms)."""
     t0 = time.monotonic()
     client = None
@@ -156,10 +161,10 @@ def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_T
         sftp.chmod(remote, 0o755)
         sftp.close()
         cmd = f"bash {remote}; _rc=$?; rm -f {remote}; exit $_rc"
-        _, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12)
+        _, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
         code = stdout.channel.recv_exit_status()
         out  = stdout.read().decode("utf-8", errors="replace")
-        err  = stderr.read().decode("utf-8", errors="replace")
+        err  = "" if pty else stderr.read().decode("utf-8", errors="replace")
     except Exception as e:
         code, out, err = -1, "", str(e)
     finally:
@@ -397,7 +402,7 @@ def do_tags(_args=None):
     console.print(t)
 
 
-def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, output_file=None):
+def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, output_file=None, pty=False):
     if hosts is None:
         hosts = load_hosts()
     if not hosts:
@@ -419,7 +424,7 @@ def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, 
     lock = threading.Lock()
 
     def _run(name):
-        r = ssh_run(name, hosts[name], command, timeout)
+        r = ssh_run(name, hosts[name], command, timeout, pty)
         with lock:
             results[name] = r
 
@@ -432,7 +437,7 @@ def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, 
     return results
 
 
-def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TIMEOUT, output_file=None):
+def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TIMEOUT, output_file=None, pty=False):
     if hosts is None:
         hosts = load_hosts()
     if not hosts:
@@ -453,7 +458,7 @@ def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TI
     lock = threading.Lock()
 
     def _run(name):
-        r = ssh_script(name, hosts[name], script_path, timeout)
+        r = ssh_script(name, hosts[name], script_path, timeout, pty)
         with lock:
             results[name] = r
 
@@ -544,6 +549,95 @@ def do_repl(_args=None):
         do_run(hosts, selected, cmd)
         console.print()
 
+# ── Conexão SSH interativa ────────────────────────────────────────────────────
+
+def _build_ssh_argv(info: dict) -> list:
+    ssh_bin = shutil.which("ssh") or "ssh"
+    return [ssh_bin, "-p", str(info.get("port", 22)), f"{info['user']}@{info['host']}"]
+
+
+def _try_open_new_tab(ssh_argv: list) -> bool:
+    """Tenta abrir ssh em nova guia/janela de terminal. Retorna True se conseguiu."""
+    # tmux: abre nova janela na sessão atual
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        try:
+            subprocess.Popen(["tmux", "new-window"] + ssh_argv)
+            return True
+        except Exception:
+            pass
+
+    cmd_str = shlex.join(ssh_argv)
+
+    # Terminais gráficos comuns no Linux
+    candidates: list[list[str]] = []
+    if shutil.which("gnome-terminal"):
+        candidates.append(["gnome-terminal", "--tab", "--"] + ssh_argv)
+    if shutil.which("konsole"):
+        candidates.append(["konsole", "--new-tab", "-e"] + ssh_argv)
+    if shutil.which("xfce4-terminal"):
+        candidates.append(["xfce4-terminal", "--tab", "-e", cmd_str])
+    if shutil.which("tilix"):
+        candidates.append(["tilix", "--action=app-new-session", "-e"] + ssh_argv)
+    if shutil.which("xterm"):
+        candidates.append(["xterm", "-e"] + ssh_argv)
+
+    for cmd in candidates:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            continue
+
+    return False
+
+
+def do_connect(_args=None, host_name: str = None):
+    """Abre sessão SSH interativa em um host (nova guia se possível)."""
+    hosts = load_hosts()
+    if not hosts:
+        console.print("[yellow]Nenhum host cadastrado.[/]")
+        return
+
+    if host_name and host_name not in hosts:
+        console.print(f"[red]Host '{host_name}' não encontrado.[/]")
+        return
+
+    if not host_name:
+        choices = []
+        for name, h in sorted(hosts.items()):
+            tags_str = f"  [{', '.join(h.get('tags', []))}]" if h.get("tags") else ""
+            choices.append(Choice(
+                title=f"{name}  [dim]{h['user']}@{h['host']}:{h.get('port',22)}[/dim]{tags_str}",
+                value=name,
+            ))
+        host_name = questionary.select(
+            "Conectar a qual host?",
+            choices=choices,
+            style=_style,
+        ).ask()
+        if not host_name:
+            return
+
+    info = hosts[host_name]
+    ssh_argv = _build_ssh_argv(info)
+
+    console.print(
+        f"\nAbrindo SSH para [bold cyan]{host_name}[/] "
+        f"([dim]{info['user']}@{info['host']}:{info.get('port', 22)}[/dim])..."
+    )
+
+    if info.get("password"):
+        # Com senha, fica no terminal atual para o usuário digitar normalmente
+        console.print("[dim]Conectando no terminal atual (autenticação por senha).[/]\n")
+        subprocess.call(ssh_argv)
+    elif _try_open_new_tab(ssh_argv):
+        console.print("[dim]Sessão SSH aberta em nova guia.[/]")
+    else:
+        console.print("[dim]Nova guia não disponível — conectando no terminal atual.[/]\n")
+        subprocess.call(ssh_argv)
+    console.print()
+
+
 # ── Menu interativo principal ─────────────────────────────────────────────────
 
 def interactive_menu():
@@ -558,10 +652,11 @@ def interactive_menu():
         choice = questionary.select(
             "O que deseja fazer?",
             choices=[
-                Choice("Executar comando nos hosts",      "run"),
+                Choice("Executar comando nos hosts",        "run"),
                 Choice("Sessão interativa (multi-comando)", "repl"),
-                Choice("Executar script nos hosts",        "script"),
-                Choice("Testar conectividade SSH",         "test"),
+                Choice("Conectar a um host (SSH direto)",   "connect"),
+                Choice("Executar script nos hosts",         "script"),
+                Choice("Testar conectividade SSH",          "test"),
                 Separator("─── Gerenciar hosts ───"),
                 Choice("Adicionar host",    "add"),
                 Choice("Editar host",       "edit"),
@@ -579,15 +674,16 @@ def interactive_menu():
 
         console.print()
         {
-            "run":    do_run,
-            "repl":   do_repl,
-            "script": do_script,
-            "test":   do_test,
-            "add":    do_add,
-            "edit":   do_edit,
-            "list":   do_list,
-            "remove": do_remove,
-            "tags":   do_tags,
+            "run":     do_run,
+            "repl":    do_repl,
+            "connect": do_connect,
+            "script":  do_script,
+            "test":    do_test,
+            "add":     do_add,
+            "edit":    do_edit,
+            "list":    do_list,
+            "remove":  do_remove,
+            "tags":    do_tags,
         }[choice]()
         console.print()
 
@@ -609,6 +705,7 @@ subcomandos:
   script ARQUIVO   Envia e executa um script shell
   test             Testa conectividade SSH
   repl             Sessão interativa (mantém seleção de hosts)
+  connect [NOME]   Abre sessão SSH interativa em um host (nova guia se possível)
 
 exemplos:
   multissh                        # menu interativo
@@ -619,6 +716,7 @@ exemplos:
   multissh run --all "whoami"     # executa em todos os hosts
   multissh script deploy.sh --tag producao
   multissh test --all             # testa todos os hosts
+  multissh connect webserver1     # conecta diretamente ao host 'webserver1'
         """,
     )
     p.add_argument(
@@ -635,6 +733,9 @@ exemplos:
     sub.add_parser("tags",   help="Lista tags")
     sub.add_parser("repl",   help="Sessão interativa")
 
+    con_p = sub.add_parser("connect", help="Abre sessão SSH interativa em um host")
+    con_p.add_argument("name", nargs="?", help="Nome do host (opcional)")
+
     def add_host_filters(sp):
         sp.add_argument("--tag", dest="tags", action="append", metavar="TAG",
                         help="Filtra hosts por tag (pode repetir)")
@@ -644,11 +745,13 @@ exemplos:
     run_p = sub.add_parser("run", help="Executa um comando")
     run_p.add_argument("command", nargs="*", help="Comando a executar")
     run_p.add_argument("--output", metavar="ARQUIVO", help="Salva saída em arquivo")
+    run_p.add_argument("--pty", action="store_true", help="Aloca PTY (útil para sudo e comandos que exigem TTY)")
     add_host_filters(run_p)
 
     scr_p = sub.add_parser("script", help="Envia e executa um script")
     scr_p.add_argument("file", nargs="?", help="Caminho do script")
     scr_p.add_argument("--output", metavar="ARQUIVO", help="Salva saída em arquivo")
+    scr_p.add_argument("--pty", action="store_true", help="Aloca PTY (útil para sudo e comandos que exigem TTY)")
     add_host_filters(scr_p)
 
     tst_p = sub.add_parser("test", help="Testa conectividade")
@@ -677,12 +780,13 @@ def main():
         return
 
     handlers = {
-        "add":    lambda: do_add(),
-        "edit":   lambda: do_edit(),
-        "list":   lambda: do_list(),
-        "remove": lambda: do_remove(),
-        "tags":   lambda: do_tags(),
-        "repl":   lambda: do_repl(),
+        "add":     lambda: do_add(),
+        "edit":    lambda: do_edit(),
+        "list":    lambda: do_list(),
+        "remove":  lambda: do_remove(),
+        "tags":    lambda: do_tags(),
+        "repl":    lambda: do_repl(),
+        "connect": lambda: do_connect(host_name=getattr(args, "name", None)),
     }
 
     if args.cmd in handlers:
@@ -698,10 +802,10 @@ def main():
     try:
         if args.cmd == "run":
             cmd = " ".join(args.command) if args.command else None
-            do_run(hosts, pre, cmd, args.timeout, getattr(args, "output", None))
+            do_run(hosts, pre, cmd, args.timeout, getattr(args, "output", None), getattr(args, "pty", False))
 
         elif args.cmd == "script":
-            do_script(hosts, pre, getattr(args, "file", None), args.timeout, getattr(args, "output", None))
+            do_script(hosts, pre, getattr(args, "file", None), args.timeout, getattr(args, "output", None), getattr(args, "pty", False))
 
         elif args.cmd == "test":
             do_test(hosts, pre, args.timeout)
