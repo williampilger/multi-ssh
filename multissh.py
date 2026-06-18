@@ -54,6 +54,13 @@ if _missing:
     print(f"[multi-ssh] Instale com:  pip install {' '.join(_missing)}")
     sys.exit(1)
 
+from prompt_toolkit import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.styles import Style as PTStyle
+
 # ── Configuração ──────────────────────────────────────────────────────────────
 
 CONFIG_DIR      = Path.home() / ".config" / "multi-ssh"
@@ -105,6 +112,22 @@ def all_tags(hosts: dict) -> list:
 
 def hosts_by_tags(hosts: dict, tags: list) -> list:
     return [n for n, h in hosts.items() if any(t in tags for t in h.get("tags", []))]
+
+
+def hosts_by_tags_advanced(hosts: dict, or_tags: list, and_tags: list) -> list:
+    """
+    or_tags:  host precisa ter PELO MENOS UMA dessas tags (se lista não vazia)
+    and_tags: host precisa ter TODAS essas tags
+    """
+    result = []
+    for n, h in hosts.items():
+        htags = set(h.get("tags", []))
+        if and_tags and not all(t in htags for t in and_tags):
+            continue
+        if or_tags and not any(t in htags for t in or_tags):
+            continue
+        result.append(n)
+    return result
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
 
@@ -214,6 +237,97 @@ def show_results(order: list, results: dict, output_file: str = None):
 
 # ── Seleção interativa de hosts ───────────────────────────────────────────────
 
+def _tristate_tag_selector(tags: list) -> tuple:
+    """
+    Seletor de tags com três estados por item:
+      ○  (0) = não selecionada
+      ●  (1) = OU  — host precisa ter pelo menos uma tag OU
+      ★  (2) = E   — host precisa ter esta tag obrigatoriamente
+
+    Teclas: ↑↓ navegar  |  espaço ciclar estado  |  enter confirmar  |  esc cancelar
+    Retorna (or_tags, and_tags).
+    """
+    # Símbolos com fallback ASCII para terminais antigos (Windows cmd legado)
+    try:
+        "❯●★○".encode(sys.stdout.encoding or "utf-8")
+        POINTER = "❯"
+        ICONS   = [" ○ ", " ● ", " ★ "]
+    except (UnicodeEncodeError, TypeError):
+        POINTER = ">"
+        ICONS   = ["[ ]", "[o]", "[E]"]
+
+    ICON_STYLES = ["", "class:tag-or", "class:tag-and"]
+    HINT = (
+        " ○ nenhuma   ● OU   ★ E/obrigatória"
+        "   [↑↓] mover   [espaço] ciclar   [enter] confirmar   [esc] cancelar\n\n"
+    )
+
+    states: list[int] = [0] * len(tags)
+    cursor = 0
+    confirmed = False
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event):
+        nonlocal cursor
+        cursor = (cursor - 1) % len(tags)
+
+    @kb.add("down")
+    def _down(event):
+        nonlocal cursor
+        cursor = (cursor + 1) % len(tags)
+
+    @kb.add("space")
+    def _cycle(event):
+        states[cursor] = (states[cursor] + 1) % 3
+
+    @kb.add("enter")
+    def _confirm(event):
+        nonlocal confirmed
+        confirmed = True
+        event.app.exit()
+
+    @kb.add("c-c")
+    @kb.add("escape")
+    def _cancel(event):
+        event.app.exit()
+
+    def get_tokens():
+        tokens: list = []
+        tokens.append(("class:header", " Selecione as tags:\n"))
+        tokens.append(("class:hint", HINT))
+        for i, tag in enumerate(tags):
+            s = states[i]
+            tokens.append(("class:pointer" if i == cursor else "", f" {POINTER} " if i == cursor else "   "))
+            tokens.append((ICON_STYLES[s], ICONS[s]))
+            tokens.append((ICON_STYLES[s] + " bold" if s else "", tag + "\n"))
+        return tokens
+
+    style = PTStyle.from_dict({
+        "header":  "bold",
+        "hint":    "fg:#858585 italic",
+        "pointer": "fg:#5f87ff bold",
+        "tag-or":  "fg:#ffaf00 bold",
+        "tag-and": "fg:#00d7af bold",
+    })
+
+    Application(
+        layout=Layout(Window(FormattedTextControl(get_tokens), dont_extend_height=True)),
+        key_bindings=kb,
+        style=style,
+        full_screen=False,
+        mouse_support=False,
+    ).run()
+
+    if not confirmed:
+        return [], []
+    return (
+        [tags[i] for i, s in enumerate(states) if s == 1],
+        [tags[i] for i, s in enumerate(states) if s == 2],
+    )
+
+
 def select_hosts(hosts: dict) -> list:
     if not hosts:
         console.print("[yellow]Nenhum host cadastrado. Use 'add' para cadastrar.[/]")
@@ -236,14 +350,17 @@ def select_hosts(hosts: dict) -> list:
         if not tags:
             console.print("[yellow]Nenhuma tag definida.[/]")
             return []
-        chosen = questionary.checkbox(
-            "Selecione as tags (espaço = marcar, enter = confirmar):",
-            choices=tags,
-            style=_style,
-        ).ask()
-        if not chosen:
+        or_tags, and_tags = _tristate_tag_selector(tags)
+        if not or_tags and not and_tags:
             return []
-        return hosts_by_tags(hosts, chosen)
+        selected = hosts_by_tags_advanced(hosts, or_tags, and_tags)
+        parts = []
+        if and_tags:
+            parts.append(f"[bold cyan]E[/]({', '.join(and_tags)})")
+        if or_tags:
+            parts.append(f"[bold yellow]OU[/]({', '.join(or_tags)})")
+        console.print(f"[dim]Filtro: {' + '.join(parts)} → {len(selected)} host(s)[/]")
+        return selected
 
     # Seleção individual
     choices = []
