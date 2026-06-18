@@ -632,7 +632,7 @@ def do_test(hosts=None, preselected=None, timeout=DEFAULT_TIMEOUT):
     console.print(f"[green]{ok} OK[/]  [red]{fail} falha(s)[/]")
 
 
-def do_repl(_args=None):
+def do_repl(_args=None, timeout: int = DEFAULT_TIMEOUT):
     """Sessão interativa: seleciona hosts uma vez, executa vários comandos."""
     hosts = load_hosts()
     if not hosts:
@@ -663,7 +663,7 @@ def do_repl(_args=None):
             console.print(f"Hosts: {', '.join(f'[cyan]{n}[/]' for n in selected)}\n")
             continue
 
-        do_run(hosts, selected, cmd)
+        do_run(hosts, selected, cmd, timeout)
         console.print()
 
 # ── Conexão SSH interativa ────────────────────────────────────────────────────
@@ -757,7 +757,7 @@ def do_connect(_args=None, host_name: str = None):
 
 # ── Menu interativo principal ─────────────────────────────────────────────────
 
-def interactive_menu():
+def interactive_menu(timeout: int = DEFAULT_TIMEOUT):
     console.print(Panel.fit(
         "[bold cyan]multi-ssh[/]\n"
         "[dim]Execute comandos SSH em múltiplos hosts ao mesmo tempo[/]",
@@ -791,11 +791,11 @@ def interactive_menu():
 
         console.print()
         {
-            "run":     do_run,
-            "repl":    do_repl,
+            "run":     lambda: do_run(timeout=timeout),
+            "repl":    lambda: do_repl(timeout=timeout),
             "connect": do_connect,
-            "script":  do_script,
-            "test":    do_test,
+            "script":  lambda: do_script(timeout=timeout),
+            "test":    lambda: do_test(timeout=timeout),
             "add":     do_add,
             "edit":    do_edit,
             "list":    do_list,
@@ -891,7 +891,7 @@ def main():
 
     if not args.cmd:
         try:
-            interactive_menu()
+            interactive_menu(args.timeout)
         except KeyboardInterrupt:
             console.print("\n[dim]Saindo.[/]")
         return
