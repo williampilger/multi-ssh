@@ -68,7 +68,7 @@ from prompt_toolkit.styles import Style as PTStyle
 
 CONFIG_DIR      = Path.home() / ".config" / "multi-ssh"
 HOSTS_FILE      = CONFIG_DIR / "hosts.json"
-DEFAULT_TIMEOUT = 15   # segundos para conexão SSH
+DEFAULT_TIMEOUT = 5   # segundos para conexão SSH
 
 console = Console()
 
@@ -744,6 +744,17 @@ def _sftp_listdir(sftp, path: str) -> tuple:
     return entries, None
 
 
+def _sftp_rmtree(sftp, path: str):
+    """Remove recursivamente um arquivo ou diretório via SFTP."""
+    attr = sftp.stat(path)
+    if _stat_mod.S_ISDIR(attr.st_mode):
+        for item in sftp.listdir_attr(path):
+            _sftp_rmtree(sftp, _sftp_join(path, item.filename))
+        sftp.rmdir(path)
+    else:
+        sftp.remove(path)
+
+
 def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
     """TUI interativo de exploração de arquivos via SFTP."""
     VISIBLE = 18
@@ -846,6 +857,7 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
             clamp_scroll()
 
     @kb.add("enter")
+    @kb.add("right")
     def _enter(event):
         nonlocal status_msg
         if not entries:
@@ -864,6 +876,7 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
         toggle_current()
 
     @kb.add("backspace")
+    @kb.add("left")
     def _back(event):
         nonlocal status_msg
         parent = _sftp_parent(current_path)
@@ -892,6 +905,22 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
     @kb.add("U")
     def _upload(event):
         event.app.exit(result=("upload",))
+
+    @kb.add("delete")
+    def _delete(event):
+        nonlocal status_msg
+        if not entries:
+            return
+        # Arquivos marcados → deleta todos; senão deleta o item sob o cursor
+        if selected:
+            to_del = list(selected)
+        else:
+            entry = entries[cursor]
+            if entry["is_parent"]:
+                status_msg = "Não é possível deletar o diretório pai"
+                return
+            to_del = [entry["name"]]
+        event.app.exit(result=("delete", to_del))
 
     @kb.add("r")
     @kb.add("R")
@@ -953,8 +982,7 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
         if status_msg:
             toks.append(("class:sts", f" {status_msg}\n"))
         toks.append(("class:hint",
-            " ↑↓/PgUp/Dn mover   Enter/Espaço marcar   ← voltar   "
-            "D baixar   U enviar   R atualizar   Q sair\n"
+            " Espaço marcar   D baixar   U enviar   Del deletar   R atualizar   Q sair\n"
         ))
         return toks
 
@@ -1045,6 +1073,36 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
                 else:
                     status_msg = f"✓ {n} arquivo(s) baixado(s) em {dest_dir}"
                 selected.clear()
+
+        elif action == "delete":
+            names = result[1]
+            n     = len(names)
+            console.print()
+            preview = ", ".join(names[:5]) + ("..." if n > 5 else "")
+            console.print(f"[bold red]Deletar {n} item(s) no host remoto:[/] {preview}")
+            console.print("[red bold]Esta ação é IRREVERSÍVEL e pode remover diretórios inteiros.[/]")
+            try:
+                confirm = input("  Confirma? [s/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = ""
+            if confirm in ("s", "sim", "y", "yes"):
+                errs = []
+                for name in names:
+                    path = _sftp_join(current_path, name)
+                    try:
+                        _sftp_rmtree(sftp, path)
+                        console.print(f"[green]✓ Deletado: {name}[/]")
+                    except Exception as ex:
+                        errs.append(name)
+                        console.print(f"[red]✗ {name}: {ex}[/]")
+                if errs:
+                    status_msg = f"✗ {len(errs)} erro(s) ao deletar"
+                else:
+                    status_msg = f"✓ {n} item(s) deletado(s)"
+                selected.clear()
+                reload()
+            else:
+                status_msg = "Deleção cancelada"
 
 
 def do_explore(host_name: str = None, timeout: int = DEFAULT_TIMEOUT):

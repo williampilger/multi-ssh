@@ -1,7 +1,7 @@
 # multi-ssh
 
-> ⚠️ O código, bem como os scripts de instalação foram criados pelo `Claude Code` em **11 de Junho de 2024**.
-> Utilize por sua conta e risco, revise o código antes de rodar, e sinta-se à vontade para contribuir com melhorias ou correções.
+> ⚠️ Aplicativo de terminal desenvolvido com **uso pesado** de geração de código por IA (Claude Code).
+> Embora o código tenha sido revisado e ajustado, use por sua conta e risco.
 
 
 Execute comandos SSH em múltiplos hosts simultaneamente.
