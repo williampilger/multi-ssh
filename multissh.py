@@ -788,7 +788,95 @@ def _sftp_rmtree(sftp, path: str):
         sftp.remove(path)
 
 
-def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
+def _sudo_exec(client, cmd: str, password) -> tuple:
+    """Executa comando com sudo via SSH. Retorna (stdout, stderr, exit_code)."""
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
+    if password:
+        stdin.write(password + "\n")
+        stdin.flush()
+    out  = stdout.read().decode("utf-8", errors="replace")
+    err  = stderr.read().decode("utf-8", errors="replace")
+    code = stdout.channel.recv_exit_status()
+    return out, err, code
+
+
+def _sudo_listdir(client, path: str, password) -> tuple:
+    """Lista diretório via sudo find quando SFTP não tem permissão."""
+    q   = shlex.quote(path)
+    cmd = f"sudo -S -p '' find {q} -maxdepth 1 -mindepth 1 -printf '%y\\t%s\\t%Ts\\t%f\\n' 2>/dev/null"
+    out, err, code = _sudo_exec(client, cmd, password)
+    if code != 0:
+        return None, err.strip() or "Permissão negada (sudo)"
+
+    entries = []
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            continue
+        ftype, size_str, mtime_str, name = parts
+        if name in (".", ".."):
+            continue
+        is_dir = ftype == "d"
+        try:
+            size  = None if is_dir else int(size_str)
+            mtime = int(mtime_str) if mtime_str.isdigit() else None
+        except ValueError:
+            size, mtime = None, None
+        entries.append({"name": name, "is_dir": is_dir, "size": size,
+                        "mtime": mtime, "is_parent": False})
+
+    entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+    parent = _sftp_parent(path)
+    if parent != path:
+        entries.insert(0, {"name": "..", "is_dir": True,
+                           "size": None, "mtime": None, "is_parent": True})
+    return entries, None
+
+
+def _sudo_download(client, remote_src: str, local_dest: str, password) -> str | None:
+    """Baixa arquivo via sudo cat. Retorna mensagem de erro ou None em caso de sucesso."""
+    import uuid as _uuid
+    cmd = f"sudo -S -p '' cat {shlex.quote(remote_src)}"
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=120)
+    if password:
+        stdin.write(password + "\n")
+        stdin.flush()
+    data = stdout.read()
+    code = stdout.channel.recv_exit_status()
+    if code != 0:
+        return stderr.read().decode("utf-8", errors="replace").strip() or "Erro ao baixar com sudo"
+    with open(local_dest, "wb") as f:
+        f.write(data)
+    return None
+
+
+def _sudo_rmtree(client, path: str, password) -> str | None:
+    """Remove arquivo/diretório via sudo rm -rf. Retorna erro ou None."""
+    _, err, code = _sudo_exec(client, f"sudo -S -p '' rm -rf {shlex.quote(path)}", password)
+    if code != 0:
+        return err.strip() or "Erro ao deletar com sudo"
+    return None
+
+
+def _sudo_upload(sftp, client, local_path: str, remote_dest: str, password) -> str | None:
+    """Envia arquivo via SFTP para /tmp e move com sudo. Retorna erro ou None."""
+    import uuid as _uuid
+    tmp = f"/tmp/_mssh_ul_{_uuid.uuid4().hex[:8]}"
+    try:
+        sftp.put(local_path, tmp)
+    except Exception as e:
+        return str(e)
+    _, err, code = _sudo_exec(
+        client, f"sudo -S -p '' mv {shlex.quote(tmp)} {shlex.quote(remote_dest)}", password
+    )
+    if code != 0:
+        _sudo_exec(client, f"rm -f {shlex.quote(tmp)}", None)
+        return err.strip() or "Erro ao mover com sudo"
+    return None
+
+
+def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str,
+                      client=None, password=None):
     """TUI interativo de exploração de arquivos via SFTP."""
     VISIBLE = 18
     PAGE    = 10
@@ -800,14 +888,29 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
     scroll       = 0
     error_msg    = ""
     status_msg   = ""
+    sudo_mode    = False    # True quando o diretório atual só é acessível via sudo
+
+    _can_sudo = (client is not None and os_type == "unix")
 
     def reload(path=None):
-        nonlocal entries, cursor, scroll, error_msg, current_path, selected
+        nonlocal entries, cursor, scroll, error_msg, current_path, selected, sudo_mode
         p = path if path is not None else current_path
         e, err = _sftp_listdir(sftp, p)
         if err:
+            if _can_sudo:
+                e2, err2 = _sudo_listdir(client, p, password)
+                if e2 is not None:
+                    current_path = p
+                    entries      = e2
+                    error_msg    = ""
+                    cursor       = 0
+                    scroll       = 0
+                    selected     = set()
+                    sudo_mode    = True
+                    return True
             error_msg = err
             return False
+        sudo_mode    = False
         current_path = p
         entries      = e
         error_msg    = ""
@@ -973,6 +1076,8 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
         toks = []
         toks.append(("class:title", f" {host_name}  "))
         toks.append(("class:os",    f"[{os_type}]"))
+        if sudo_mode:
+            toks.append(("class:sudo", "  [sudo]"))
         if selected:
             toks.append(("class:sel-n", f"  [{len(selected)} selecionado(s)]"))
         toks.append(("", "\n"))
@@ -1022,6 +1127,7 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
     pt_style = PTStyle.from_dict({
         "title": "bold cyan",
         "os":    "fg:#666666",
+        "sudo":  "fg:#ffaf00 bold",
         "sel-n": "fg:#00af5f bold",
         "path":  "fg:#ffaf00 bold",
         "sep":   "fg:#3a3a3a",
@@ -1064,15 +1170,22 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
                 lp = Path(local_raw).expanduser()
                 if lp.is_file():
                     remote_dest = _sftp_join(current_path, lp.name)
-                    try:
-                        console.print(f"[dim]Enviando {lp.name} → {remote_dest} ...[/]")
-                        sftp.put(str(lp), remote_dest)
-                        console.print(f"[green]✓ Enviado com sucesso[/]")
+                    console.print(f"[dim]Enviando {lp.name} → {remote_dest} ...[/]")
+                    if sudo_mode:
+                        err = _sudo_upload(sftp, client, str(lp), remote_dest, password)
+                    else:
+                        err = None
+                        try:
+                            sftp.put(str(lp), remote_dest)
+                        except Exception as ex:
+                            err = str(ex)
+                    if err:
+                        console.print(f"[red]Erro ao enviar: {err}[/]")
+                        status_msg = "✗ Erro ao enviar"
+                    else:
+                        console.print("[green]✓ Enviado com sucesso[/]")
                         status_msg = f"✓ Enviado: {lp.name}"
                         reload()
-                    except Exception as ex:
-                        console.print(f"[red]Erro ao enviar: {ex}[/]")
-                        status_msg = "✗ Erro ao enviar"
                 else:
                     console.print(f"[red]Arquivo não encontrado: {lp}[/]")
                     status_msg = "✗ Arquivo não encontrado"
@@ -1095,12 +1208,20 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
                 for fname in filenames:
                     remote_src = _sftp_join(current_path, fname)
                     dest_path  = str(dest_dir / fname)
-                    try:
-                        sftp.get(remote_src, dest_path)
-                        console.print(f"[green]✓ {fname}[/]")
-                    except Exception as ex:
-                        errs.append(fname)
-                        console.print(f"[red]✗ {fname}: {ex}[/]")
+                    if sudo_mode:
+                        err = _sudo_download(client, remote_src, dest_path, password)
+                        if err:
+                            errs.append(fname)
+                            console.print(f"[red]✗ {fname}: {err}[/]")
+                        else:
+                            console.print(f"[green]✓ {fname}[/]")
+                    else:
+                        try:
+                            sftp.get(remote_src, dest_path)
+                            console.print(f"[green]✓ {fname}[/]")
+                        except Exception as ex:
+                            errs.append(fname)
+                            console.print(f"[red]✗ {fname}: {ex}[/]")
                 if errs:
                     status_msg = f"✗ {len(errs)} erro(s)"
                 else:
@@ -1122,12 +1243,20 @@ def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
                 errs = []
                 for name in names:
                     path = _sftp_join(current_path, name)
-                    try:
-                        _sftp_rmtree(sftp, path)
-                        console.print(f"[green]✓ Deletado: {name}[/]")
-                    except Exception as ex:
-                        errs.append(name)
-                        console.print(f"[red]✗ {name}: {ex}[/]")
+                    if sudo_mode:
+                        err = _sudo_rmtree(client, path, password)
+                        if err:
+                            errs.append(name)
+                            console.print(f"[red]✗ {name}: {err}[/]")
+                        else:
+                            console.print(f"[green]✓ Deletado: {name}[/]")
+                    else:
+                        try:
+                            _sftp_rmtree(sftp, path)
+                            console.print(f"[green]✓ Deletado: {name}[/]")
+                        except Exception as ex:
+                            errs.append(name)
+                            console.print(f"[red]✗ {name}: {ex}[/]")
                 if errs:
                     status_msg = f"✗ {len(errs)} erro(s) ao deletar"
                 else:
@@ -1179,7 +1308,7 @@ def do_explore(host_name: str = None, timeout: int = DEFAULT_TIMEOUT):
         except Exception:
             start = "/"
         console.print(f"[dim]SO detectado: {os_type}  |  Diretório inicial: {start}[/]\n")
-        _run_file_browser(sftp, host_name, start, os_type)
+        _run_file_browser(sftp, host_name, start, os_type, client, info.get("password"))
     except Exception as e:
         console.print(f"[red]Erro SFTP: {e}[/]")
     finally:
