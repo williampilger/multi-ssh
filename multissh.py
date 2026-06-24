@@ -10,6 +10,7 @@ Uso:
   multissh script deploy.sh   # envia e executa script
   multissh add                # cadastra novo host
   multissh connect [NOME]     # abre sessão SSH interativa em um host
+  multissh explore [NOME]    # explorador de arquivos SFTP em um host
 """
 
 import json
@@ -20,7 +21,9 @@ import argparse
 import shlex
 import subprocess
 import shutil
+import stat as _stat_mod
 from pathlib import Path
+from datetime import datetime as _dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
@@ -666,6 +669,439 @@ def do_repl(_args=None, timeout: int = DEFAULT_TIMEOUT):
         do_run(hosts, selected, cmd, timeout)
         console.print()
 
+# ── Explorador de arquivos (SFTP) ─────────────────────────────────────────────
+
+def _detect_os_type(client: paramiko.SSHClient) -> str:
+    """Detecta se o host remoto é Unix ou Windows via SSH."""
+    try:
+        _, stdout, _ = client.exec_command("uname -s", timeout=5)
+        output = stdout.read().decode("utf-8", errors="replace").strip()
+        if output:
+            return "unix"
+    except Exception:
+        pass
+    return "windows"
+
+
+def _sftp_join(base: str, name: str) -> str:
+    base = base.rstrip("/")
+    return f"{base}/{name}"
+
+
+def _sftp_parent(path: str) -> str:
+    path = path.rstrip("/")
+    if "/" not in path:
+        return path
+    parent, _, _ = path.rpartition("/")
+    return parent or "/"
+
+
+def _fmt_size(size) -> str:
+    if size is None:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
+
+
+def _fmt_mtime(mtime) -> str:
+    if not mtime:
+        return ""
+    try:
+        return _dt.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _sftp_listdir(sftp, path: str) -> tuple:
+    """Retorna (entries, error). entries = lista de dicts com name/is_dir/size/mtime/is_parent."""
+    try:
+        raw = sftp.listdir_attr(path)
+    except Exception as e:
+        return None, str(e)
+
+    entries = []
+    for attr in raw:
+        is_dir = bool(attr.st_mode and _stat_mod.S_ISDIR(attr.st_mode))
+        entries.append({
+            "name":      attr.filename,
+            "is_dir":    is_dir,
+            "size":      None if is_dir else attr.st_size,
+            "mtime":     attr.st_mtime,
+            "is_parent": False,
+        })
+    entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+
+    parent = _sftp_parent(path)
+    if parent != path:
+        entries.insert(0, {
+            "name": "..", "is_dir": True,
+            "size": None, "mtime": None, "is_parent": True,
+        })
+
+    return entries, None
+
+
+def _run_file_browser(sftp, host_name: str, start_path: str, os_type: str):
+    """TUI interativo de exploração de arquivos via SFTP."""
+    VISIBLE = 18
+    PAGE    = 10
+
+    current_path = start_path
+    entries: list = []
+    selected: set = set()   # nomes de arquivos marcados para download
+    cursor       = 0
+    scroll       = 0
+    error_msg    = ""
+    status_msg   = ""
+
+    def reload(path=None):
+        nonlocal entries, cursor, scroll, error_msg, current_path, selected
+        p = path if path is not None else current_path
+        e, err = _sftp_listdir(sftp, p)
+        if err:
+            error_msg = err
+            return False
+        current_path = p
+        entries      = e
+        error_msg    = ""
+        cursor       = 0
+        scroll       = 0
+        selected     = set()
+        return True
+
+    reload()
+
+    try:
+        "❯📁📄✓".encode(sys.stdout.encoding or "utf-8")
+        PTR = "❯"; DICON = "📁"; FICON = "📄"; CHK = "✓"
+    except (UnicodeEncodeError, TypeError):
+        PTR = ">"; DICON = "[D]"; FICON = "[ ]"; CHK = "*"
+
+    def clamp_scroll():
+        nonlocal scroll
+        if cursor < scroll:
+            scroll = cursor
+        elif cursor >= scroll + VISIBLE:
+            scroll = cursor - VISIBLE + 1
+
+    def toggle_current():
+        """Marca/desmarca o arquivo sob o cursor."""
+        nonlocal status_msg
+        if not entries:
+            return
+        entry = entries[cursor]
+        if entry["is_dir"]:
+            return
+        fname = entry["name"]
+        if fname in selected:
+            selected.discard(fname)
+        else:
+            selected.add(fname)
+        n = len(selected)
+        status_msg = f"{n} arquivo(s) selecionado(s)" if n else ""
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event):
+        nonlocal cursor
+        cursor = max(0, cursor - 1)
+        clamp_scroll()
+
+    @kb.add("down")
+    def _down(event):
+        nonlocal cursor
+        if entries:
+            cursor = min(len(entries) - 1, cursor + 1)
+            clamp_scroll()
+
+    @kb.add("pageup")
+    @kb.add("c-b")
+    def _pgup(event):
+        nonlocal cursor
+        cursor = max(0, cursor - PAGE)
+        clamp_scroll()
+
+    @kb.add("pagedown")
+    @kb.add("c-f")
+    def _pgdn(event):
+        nonlocal cursor
+        if entries:
+            cursor = min(len(entries) - 1, cursor + PAGE)
+            clamp_scroll()
+
+    @kb.add("home")
+    def _home(event):
+        nonlocal cursor, scroll
+        cursor = 0; scroll = 0
+
+    @kb.add("end")
+    def _end(event):
+        nonlocal cursor
+        if entries:
+            cursor = len(entries) - 1
+            clamp_scroll()
+
+    @kb.add("enter")
+    def _enter(event):
+        nonlocal status_msg
+        if not entries:
+            return
+        entry = entries[cursor]
+        if entry["is_dir"]:
+            new_path = (_sftp_parent(current_path) if entry["is_parent"]
+                        else _sftp_join(current_path, entry["name"]))
+            if reload(new_path):
+                status_msg = ""
+        else:
+            toggle_current()
+
+    @kb.add("space")
+    def _space(event):
+        toggle_current()
+
+    @kb.add("backspace")
+    def _back(event):
+        nonlocal status_msg
+        parent = _sftp_parent(current_path)
+        if parent == current_path:
+            return
+        if reload(parent):
+            status_msg = ""
+
+    @kb.add("d")
+    @kb.add("D")
+    def _download(event):
+        nonlocal status_msg
+        if not entries:
+            return
+        # Baixa os marcados; se nenhum marcado, baixa o que está sob o cursor
+        to_dl = list(selected) if selected else None
+        if to_dl is None:
+            entry = entries[cursor]
+            if entry["is_dir"]:
+                status_msg = "Navegue até um arquivo e pressione Espaço/Enter para marcar ou D para baixar direto"
+                return
+            to_dl = [entry["name"]]
+        event.app.exit(result=("download", to_dl))
+
+    @kb.add("u")
+    @kb.add("U")
+    def _upload(event):
+        event.app.exit(result=("upload",))
+
+    @kb.add("r")
+    @kb.add("R")
+    def _refresh(event):
+        nonlocal status_msg
+        reload()
+        status_msg = "Diretório atualizado"
+
+    @kb.add("q")
+    @kb.add("Q")
+    @kb.add("c-c")
+    @kb.add("escape")
+    def _quit(event):
+        event.app.exit(result=None)
+
+    def get_tokens():
+        toks = []
+        toks.append(("class:title", f" {host_name}  "))
+        toks.append(("class:os",    f"[{os_type}]"))
+        if selected:
+            toks.append(("class:sel-n", f"  [{len(selected)} selecionado(s)]"))
+        toks.append(("", "\n"))
+        toks.append(("class:path",  f" {current_path}\n"))
+        toks.append(("class:sep",   "─" * 72 + "\n"))
+
+        if error_msg:
+            toks.append(("class:err", f" Erro: {error_msg}\n"))
+        elif not entries:
+            toks.append(("class:dim", " (diretório vazio)\n"))
+        else:
+            for i in range(scroll, min(scroll + VISIBLE, len(entries))):
+                entry  = entries[i]
+                is_cur = (i == cursor)
+                ptr    = PTR if is_cur else " "
+
+                if entry["is_dir"]:
+                    icon  = DICON
+                    mark  = "   "
+                    ntext = ".. (subir)" if entry["is_parent"] else entry["name"] + "/"
+                    extra = ""
+                    sty   = "class:dir-c" if is_cur else "class:dir"
+                else:
+                    is_chk = entry["name"] in selected
+                    icon   = FICON
+                    mark   = f"[{CHK}]" if is_chk else "[ ]"
+                    ntext  = entry["name"]
+                    extra  = f"  {_fmt_size(entry['size']):>10}   {_fmt_mtime(entry['mtime'])}"
+                    if is_chk:
+                        sty = "class:chk-c" if is_cur else "class:chk"
+                    else:
+                        sty = "class:fil-c" if is_cur else "class:fil"
+
+                toks.append((sty, f" {ptr} {icon} {mark} {ntext:<41}{extra}\n"))
+
+            if len(entries) > VISIBLE:
+                toks.append(("class:dim", f"   [{cursor + 1}/{len(entries)}]\n"))
+
+        toks.append(("class:sep", "─" * 72 + "\n"))
+        if status_msg:
+            toks.append(("class:sts", f" {status_msg}\n"))
+        toks.append(("class:hint",
+            " ↑↓/PgUp/Dn mover   Enter/Espaço marcar   ← voltar   "
+            "D baixar   U enviar   R atualizar   Q sair\n"
+        ))
+        return toks
+
+    pt_style = PTStyle.from_dict({
+        "title": "bold cyan",
+        "os":    "fg:#666666",
+        "sel-n": "fg:#00af5f bold",
+        "path":  "fg:#ffaf00 bold",
+        "sep":   "fg:#3a3a3a",
+        "dir":   "fg:#5f87ff",
+        "dir-c": "fg:#ffffff bg:#5f87ff bold",
+        "fil":   "",
+        "fil-c": "reverse bold",
+        "chk":   "fg:#00af5f",
+        "chk-c": "fg:#00af5f reverse bold",
+        "hint":  "fg:#666666 italic",
+        "err":   "fg:#ff5555 bold",
+        "dim":   "fg:#666666",
+        "sts":   "fg:#00af5f bold",
+    })
+
+    while True:
+        result = Application(
+            layout=Layout(Window(FormattedTextControl(get_tokens), dont_extend_height=True)),
+            key_bindings=kb,
+            style=pt_style,
+            full_screen=False,
+            mouse_support=False,
+        ).run()
+
+        if result is None:
+            break
+
+        status_msg = ""
+        action     = result[0]
+
+        if action == "upload":
+            console.print()
+            console.print("[bold cyan]Enviar arquivo[/]  (caminho completo no sistema local)")
+            console.print("[dim]Dica: use Tab para autocompletar no shell antes de colar aqui[/]")
+            try:
+                local_raw = input("  Arquivo local: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                local_raw = ""
+            if local_raw:
+                lp = Path(local_raw).expanduser()
+                if lp.is_file():
+                    remote_dest = _sftp_join(current_path, lp.name)
+                    try:
+                        console.print(f"[dim]Enviando {lp.name} → {remote_dest} ...[/]")
+                        sftp.put(str(lp), remote_dest)
+                        console.print(f"[green]✓ Enviado com sucesso[/]")
+                        status_msg = f"✓ Enviado: {lp.name}"
+                        reload()
+                    except Exception as ex:
+                        console.print(f"[red]Erro ao enviar: {ex}[/]")
+                        status_msg = "✗ Erro ao enviar"
+                else:
+                    console.print(f"[red]Arquivo não encontrado: {lp}[/]")
+                    status_msg = "✗ Arquivo não encontrado"
+
+        elif action == "download":
+            filenames = result[1]   # lista de nomes
+            n = len(filenames)
+            console.print()
+            console.print(f"[bold cyan]Baixar {n} arquivo(s)[/]: {', '.join(filenames[:3])}{'...' if n > 3 else ''}")
+            dl_default = str(Path.home() / "Downloads")
+            console.print(f"[dim]Diretório destino (Enter = {dl_default}):[/]")
+            try:
+                dest_raw = input("  Destino: ").strip() or dl_default
+            except (EOFError, KeyboardInterrupt):
+                dest_raw = ""
+            if dest_raw:
+                dest_dir = Path(dest_raw).expanduser()
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                errs = []
+                for fname in filenames:
+                    remote_src = _sftp_join(current_path, fname)
+                    dest_path  = str(dest_dir / fname)
+                    try:
+                        sftp.get(remote_src, dest_path)
+                        console.print(f"[green]✓ {fname}[/]")
+                    except Exception as ex:
+                        errs.append(fname)
+                        console.print(f"[red]✗ {fname}: {ex}[/]")
+                if errs:
+                    status_msg = f"✗ {len(errs)} erro(s)"
+                else:
+                    status_msg = f"✓ {n} arquivo(s) baixado(s) em {dest_dir}"
+                selected.clear()
+
+
+def do_explore(host_name: str = None, timeout: int = DEFAULT_TIMEOUT):
+    """Explorador de arquivos interativo via SFTP (Linux e Windows)."""
+    hosts = load_hosts()
+    if not hosts:
+        console.print("[yellow]Nenhum host cadastrado.[/]")
+        return
+
+    if not host_name:
+        choices = []
+        for name, h in sorted(hosts.items()):
+            tags_str = f"  [{', '.join(h.get('tags', []))}]" if h.get("tags") else ""
+            choices.append(Choice(
+                title=f"{name}  [dim]{h['user']}@{h['host']}:{h.get('port', 22)}[/dim]{tags_str}",
+                value=name,
+            ))
+        host_name = questionary.select(
+            "Explorar arquivos de qual host?",
+            choices=choices,
+            style=_style,
+        ).ask()
+        if not host_name:
+            return
+
+    info = hosts[host_name]
+    console.print(f"Conectando a [bold cyan]{host_name}[/]...")
+
+    try:
+        client = _connect(info, timeout)
+    except Exception as e:
+        console.print(f"[red]Erro ao conectar: {e}[/]")
+        return
+
+    sftp = None
+    try:
+        sftp    = client.open_sftp()
+        os_type = _detect_os_type(client)
+        try:
+            start = sftp.normalize(".")
+        except Exception:
+            start = "/"
+        console.print(f"[dim]SO detectado: {os_type}  |  Diretório inicial: {start}[/]\n")
+        _run_file_browser(sftp, host_name, start, os_type)
+    except Exception as e:
+        console.print(f"[red]Erro SFTP: {e}[/]")
+    finally:
+        if sftp:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        client.close()
+
+    console.print("[dim]Explorador encerrado.[/]")
+
+
 # ── Conexão SSH interativa ────────────────────────────────────────────────────
 
 def _build_ssh_argv(info: dict) -> list:
@@ -772,6 +1208,7 @@ def interactive_menu(timeout: int = DEFAULT_TIMEOUT):
                 Choice("Executar comando nos hosts",        "run"),
                 Choice("Sessão interativa (multi-comando)", "repl"),
                 Choice("Conectar a um host (SSH direto)",   "connect"),
+                Choice("Explorar arquivos de um host",      "explore"),
                 Choice("Executar script nos hosts",         "script"),
                 Choice("Testar conectividade SSH",          "test"),
                 Separator("─── Gerenciar hosts ───"),
@@ -794,6 +1231,7 @@ def interactive_menu(timeout: int = DEFAULT_TIMEOUT):
             "run":     lambda: do_run(timeout=timeout),
             "repl":    lambda: do_repl(timeout=timeout),
             "connect": do_connect,
+            "explore": lambda: do_explore(timeout=timeout),
             "script":  lambda: do_script(timeout=timeout),
             "test":    lambda: do_test(timeout=timeout),
             "add":     do_add,
@@ -823,6 +1261,7 @@ subcomandos:
   test             Testa conectividade SSH
   repl             Sessão interativa (mantém seleção de hosts)
   connect [NOME]   Abre sessão SSH interativa em um host (nova guia se possível)
+  explore [NOME]   Explorador de arquivos via SFTP (Linux e Windows)
 
 exemplos:
   multissh                        # menu interativo
@@ -834,6 +1273,8 @@ exemplos:
   multissh script deploy.sh --tag producao
   multissh test --all             # testa todos os hosts
   multissh connect webserver1     # conecta diretamente ao host 'webserver1'
+  multissh explore webserver1     # explorador de arquivos no host 'webserver1'
+  multissh explore                # seleciona host interativamente
         """,
     )
     p.add_argument(
@@ -852,6 +1293,9 @@ exemplos:
 
     con_p = sub.add_parser("connect", help="Abre sessão SSH interativa em um host")
     con_p.add_argument("name", nargs="?", help="Nome do host (opcional)")
+
+    exp_p = sub.add_parser("explore", help="Explorador de arquivos via SFTP")
+    exp_p.add_argument("name", nargs="?", help="Nome do host (opcional)")
 
     def add_host_filters(sp):
         sp.add_argument("--tag", dest="tags", action="append", metavar="TAG",
@@ -904,6 +1348,7 @@ def main():
         "tags":    lambda: do_tags(),
         "repl":    lambda: do_repl(),
         "connect": lambda: do_connect(host_name=getattr(args, "name", None)),
+        "explore": lambda: do_explore(host_name=getattr(args, "name", None), timeout=args.timeout),
     }
 
     if args.cmd in handlers:
