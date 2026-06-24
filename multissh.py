@@ -156,13 +156,35 @@ def _connect(host_info: dict, timeout: int) -> paramiko.SSHClient:
     return client
 
 
-def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False) -> tuple:
+def _wrap_sudo(client: paramiko.SSHClient, command: str) -> str:
+    """Retorna o comando prefixado com sudo -S se o host for Unix; caso contrário retorna inalterado."""
+    try:
+        _, uname_out, _ = client.exec_command("uname -s", timeout=5)
+        if uname_out.read().decode("utf-8", errors="replace").strip():
+            return f"sudo -S -p '' {command}"
+    except Exception:
+        pass
+    return command
+
+
+def _sudo_stdin(stdin, info: dict):
+    """Escreve a senha no stdin para o sudo -S, se disponível."""
+    password = info.get("password")
+    if password:
+        stdin.write(password + "\n")
+        stdin.flush()
+
+
+def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False, use_sudo: bool = False) -> tuple:
     """Retorna (name, exit_code, stdout, stderr, elapsed_ms)."""
     t0 = time.monotonic()
     client = None
     try:
         client = _connect(info, timeout)
-        _, stdout, stderr = client.exec_command(command, timeout=timeout * 6, get_pty=pty)
+        effective_cmd = _wrap_sudo(client, command) if use_sudo else command
+        stdin, stdout, stderr = client.exec_command(effective_cmd, timeout=timeout * 6, get_pty=pty)
+        if use_sudo and effective_cmd != command:
+            _sudo_stdin(stdin, info)
         code = stdout.channel.recv_exit_status()
         out  = stdout.read().decode("utf-8", errors="replace")
         # Com PTY, stderr é mesclado no stdout pelo terminal
@@ -175,7 +197,7 @@ def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT,
     return name, code, out, err, int((time.monotonic() - t0) * 1000)
 
 
-def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False) -> tuple:
+def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False, use_sudo: bool = False) -> tuple:
     """Envia e executa um script shell. Retorna (name, exit_code, stdout, stderr, elapsed_ms)."""
     t0 = time.monotonic()
     client = None
@@ -186,8 +208,13 @@ def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_T
         sftp.put(script_path, remote)
         sftp.chmod(remote, 0o755)
         sftp.close()
-        cmd = f"bash {remote}; _rc=$?; rm -f {remote}; exit $_rc"
-        _, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
+        base_cmd = f"bash {remote}"
+        if use_sudo:
+            base_cmd = _wrap_sudo(client, base_cmd)
+        cmd = f"{base_cmd}; _rc=$?; rm -f {remote}; exit $_rc"
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
+        if use_sudo and base_cmd.startswith("sudo"):
+            _sudo_stdin(stdin, info)
         code = stdout.channel.recv_exit_status()
         out  = stdout.read().decode("utf-8", errors="replace")
         err  = "" if pty else stderr.read().decode("utf-8", errors="replace")
@@ -522,7 +549,7 @@ def do_tags(_args=None):
     console.print(t)
 
 
-def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, output_file=None, pty=False):
+def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, output_file=None, pty=False, use_sudo=False):
     if hosts is None:
         hosts = load_hosts()
     if not hosts:
@@ -540,11 +567,14 @@ def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, 
     if not command:
         return
 
+    if use_sudo:
+        console.print("[yellow bold]Modo sudo ativo — senha enviada automaticamente em hosts Unix.[/]")
+
     results = {}
     lock = threading.Lock()
 
     def _run(name):
-        r = ssh_run(name, hosts[name], command, timeout, pty)
+        r = ssh_run(name, hosts[name], command, timeout, pty, use_sudo)
         with lock:
             results[name] = r
 
@@ -557,7 +587,7 @@ def do_run(hosts=None, preselected=None, command=None, timeout=DEFAULT_TIMEOUT, 
     return results
 
 
-def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TIMEOUT, output_file=None, pty=False):
+def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TIMEOUT, output_file=None, pty=False, use_sudo=False):
     if hosts is None:
         hosts = load_hosts()
     if not hosts:
@@ -574,11 +604,14 @@ def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TI
     if not selected:
         return
 
+    if use_sudo:
+        console.print("[yellow bold]Modo sudo ativo — senha enviada automaticamente em hosts Unix.[/]")
+
     results = {}
     lock = threading.Lock()
 
     def _run(name):
-        r = ssh_script(name, hosts[name], script_path, timeout, pty)
+        r = ssh_script(name, hosts[name], script_path, timeout, pty, use_sudo)
         with lock:
             results[name] = r
 
@@ -1251,9 +1284,10 @@ def do_connect(_args=None, host_name: str = None):
 
 # ── Menu interativo principal ─────────────────────────────────────────────────
 
-def interactive_menu(timeout: int = DEFAULT_TIMEOUT):
+def interactive_menu(timeout: int = DEFAULT_TIMEOUT, use_sudo: bool = False):
+    header_extra = "  [yellow bold][sudo][/]" if use_sudo else ""
     console.print(Panel.fit(
-        "[bold cyan]multi-ssh[/]\n"
+        f"[bold cyan]multi-ssh[/]{header_extra}\n"
         "[dim]Execute comandos SSH em múltiplos hosts ao mesmo tempo[/]",
         border_style="cyan",
         padding=(0, 2),
@@ -1286,11 +1320,11 @@ def interactive_menu(timeout: int = DEFAULT_TIMEOUT):
 
         console.print()
         {
-            "run":     lambda: do_run(timeout=timeout),
+            "run":     lambda: do_run(timeout=timeout, use_sudo=use_sudo),
             "repl":    lambda: do_repl(timeout=timeout),
             "connect": do_connect,
             "explore": lambda: do_explore(timeout=timeout),
-            "script":  lambda: do_script(timeout=timeout),
+            "script":  lambda: do_script(timeout=timeout, use_sudo=use_sudo),
             "test":    lambda: do_test(timeout=timeout),
             "add":     do_add,
             "edit":    do_edit,
@@ -1339,6 +1373,10 @@ exemplos:
         "--timeout", type=int, default=DEFAULT_TIMEOUT, metavar="SEG",
         help=f"Timeout de conexão SSH em segundos (padrão: {DEFAULT_TIMEOUT})",
     )
+    p.add_argument(
+        "--sudo", action="store_true", dest="use_sudo",
+        help="Executa comandos com sudo (usa senha armazenada; ignorado em hosts Windows)",
+    )
 
     sub = p.add_subparsers(dest="cmd")
 
@@ -1365,12 +1403,14 @@ exemplos:
     run_p.add_argument("command", nargs="*", help="Comando a executar")
     run_p.add_argument("--output", metavar="ARQUIVO", help="Salva saída em arquivo")
     run_p.add_argument("--pty", action="store_true", help="Aloca PTY (útil para sudo e comandos que exigem TTY)")
+    run_p.add_argument("--sudo", action="store_true", dest="use_sudo", help="Executa com sudo (usa senha armazenada; ignorado em hosts Windows)")
     add_host_filters(run_p)
 
     scr_p = sub.add_parser("script", help="Envia e executa um script")
     scr_p.add_argument("file", nargs="?", help="Caminho do script")
     scr_p.add_argument("--output", metavar="ARQUIVO", help="Salva saída em arquivo")
     scr_p.add_argument("--pty", action="store_true", help="Aloca PTY (útil para sudo e comandos que exigem TTY)")
+    scr_p.add_argument("--sudo", action="store_true", dest="use_sudo", help="Executa com sudo (usa senha armazenada; ignorado em hosts Windows)")
     add_host_filters(scr_p)
 
     tst_p = sub.add_parser("test", help="Testa conectividade")
@@ -1393,7 +1433,7 @@ def main():
 
     if not args.cmd:
         try:
-            interactive_menu(args.timeout)
+            interactive_menu(args.timeout, getattr(args, "use_sudo", False))
         except KeyboardInterrupt:
             console.print("\n[dim]Saindo.[/]")
         return
@@ -1422,10 +1462,10 @@ def main():
     try:
         if args.cmd == "run":
             cmd = " ".join(args.command) if args.command else None
-            do_run(hosts, pre, cmd, args.timeout, getattr(args, "output", None), getattr(args, "pty", False))
+            do_run(hosts, pre, cmd, args.timeout, getattr(args, "output", None), getattr(args, "pty", False), getattr(args, "use_sudo", False))
 
         elif args.cmd == "script":
-            do_script(hosts, pre, getattr(args, "file", None), args.timeout, getattr(args, "output", None), getattr(args, "pty", False))
+            do_script(hosts, pre, getattr(args, "file", None), args.timeout, getattr(args, "output", None), getattr(args, "pty", False), getattr(args, "use_sudo", False))
 
         elif args.cmd == "test":
             do_test(hosts, pre, args.timeout)
