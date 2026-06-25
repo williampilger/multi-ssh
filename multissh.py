@@ -218,18 +218,24 @@ def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_T
             sftp.close()
             # Converte /C:/Users/foo → C:\Users\foo
             win_path = remote_sftp.lstrip("/").replace("/", "\\")
-            wp = win_path.replace("'", "''")  # escapa aspas simples para PowerShell
-            if ext in (".bat", ".cmd"):
-                cmd = (
-                    f'cmd.exe /c "{win_path}" & '
-                    f'(set _RC=%errorlevel%) & del /f /q "{win_path}" 2>nul & exit %_RC%'
-                )
-            else:  # .ps1 e demais — usa PowerShell
-                cmd = (
-                    f"powershell.exe -ExecutionPolicy Bypass -NonInteractive -Command "
-                    f"\"$rc=1; try {{ & '{wp}'; $rc=$LASTEXITCODE }} "
-                    f"finally {{ Remove-Item -Force '{wp}' -ErrorAction SilentlyContinue }}; exit $rc\""
-                )
+            wp = win_path.replace("'", "''")  # escapa aspas simples no contexto PS
+            # .bat/.cmd roda via cmd.exe; .ps1 e demais via call direto ao script
+            runner = f"cmd.exe /c '{wp}'" if ext in (".bat", ".cmd") else f"& '{wp}'"
+            # Usa -EncodedCommand (Base64) para evitar expansão de variáveis pelo shell
+            # externo do SSH (cmd.exe ou PowerShell), independente da configuração do servidor.
+            import base64 as _b64
+            ps_cmd = (
+                f"$ProgressPreference='SilentlyContinue'; "
+                f"$InformationPreference='SilentlyContinue'; "
+                f"$WarningPreference='SilentlyContinue'; "
+                f"$VerbosePreference='SilentlyContinue'; "
+                f"$rc=1; "
+                f"try {{ {runner}; $rc=$LASTEXITCODE }} "
+                f"finally {{ Remove-Item -Force '{wp}' -ErrorAction SilentlyContinue }}; "
+                f"exit $rc"
+            )
+            encoded = _b64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
+            cmd = f"powershell.exe -ExecutionPolicy Bypass -NonInteractive -NoProfile -EncodedCommand {encoded}"
             stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
             code = stdout.channel.recv_exit_status()
             out  = stdout.read().decode("utf-8", errors="replace")
@@ -626,6 +632,11 @@ def do_script(hosts=None, preselected=None, script_path=None, timeout=DEFAULT_TI
         return
 
     if script_path is None:
+        
+        # se o timeout for baixo, avisar isso
+        if timeout < 120:
+            console.print(f"[yellow]Aviso: [red]timeout definido em {timeout}s[yellow]. Garanta que o script termine neste tempo, ou inicie o mulstissh com a flag --timeout mudando este tempo para algo como 1800s (30min).[/]")
+
         script_path = questionary.path("Arquivo de script:", style=_style).ask()
     if not script_path or not Path(script_path).exists():
         console.print(f"[red]Arquivo não encontrado: {script_path}[/]")
