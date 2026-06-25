@@ -198,26 +198,57 @@ def ssh_run(name: str, info: dict, command: str, timeout: int = DEFAULT_TIMEOUT,
 
 
 def ssh_script(name: str, info: dict, script_path: str, timeout: int = DEFAULT_TIMEOUT, pty: bool = False, use_sudo: bool = False) -> tuple:
-    """Envia e executa um script shell. Retorna (name, exit_code, stdout, stderr, elapsed_ms)."""
+    """Envia e executa um script. Detecta SO remoto: bash no Unix, PowerShell/cmd no Windows."""
     t0 = time.monotonic()
     client = None
     try:
         client = _connect(info, timeout)
-        remote = f"/tmp/_mssh_{Path(script_path).name}"
+        os_type = _detect_os_type(client)
+        script_name = Path(script_path).name
+        ext = Path(script_path).suffix.lower()
         sftp = client.open_sftp()
-        sftp.put(script_path, remote)
-        sftp.chmod(remote, 0o755)
-        sftp.close()
-        base_cmd = f"bash {remote}"
-        if use_sudo:
-            base_cmd = _wrap_sudo(client, base_cmd)
-        cmd = f"{base_cmd}; _rc=$?; rm -f {remote}; exit $_rc"
-        stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
-        if use_sudo and base_cmd.startswith("sudo"):
-            _sudo_stdin(stdin, info)
-        code = stdout.channel.recv_exit_status()
-        out  = stdout.read().decode("utf-8", errors="replace")
-        err  = "" if pty else stderr.read().decode("utf-8", errors="replace")
+
+        if os_type == "windows":
+            try:
+                sftp_home = sftp.normalize(".")
+            except Exception:
+                sftp_home = "/C:/Windows/Temp"
+            remote_sftp = f"{sftp_home.rstrip('/')}/_mssh_{script_name}"
+            sftp.put(script_path, remote_sftp)
+            sftp.close()
+            # Converte /C:/Users/foo → C:\Users\foo
+            win_path = remote_sftp.lstrip("/").replace("/", "\\")
+            wp = win_path.replace("'", "''")  # escapa aspas simples para PowerShell
+            if ext in (".bat", ".cmd"):
+                cmd = (
+                    f'cmd.exe /c "{win_path}" & '
+                    f'(set _RC=%errorlevel%) & del /f /q "{win_path}" 2>nul & exit %_RC%'
+                )
+            else:  # .ps1 e demais — usa PowerShell
+                cmd = (
+                    f"powershell.exe -ExecutionPolicy Bypass -NonInteractive -Command "
+                    f"\"$rc=1; try {{ & '{wp}'; $rc=$LASTEXITCODE }} "
+                    f"finally {{ Remove-Item -Force '{wp}' -ErrorAction SilentlyContinue }}; exit $rc\""
+                )
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
+            code = stdout.channel.recv_exit_status()
+            out  = stdout.read().decode("utf-8", errors="replace")
+            err  = "" if pty else stderr.read().decode("utf-8", errors="replace")
+        else:
+            remote = f"/tmp/_mssh_{script_name}"
+            sftp.put(script_path, remote)
+            sftp.chmod(remote, 0o755)
+            sftp.close()
+            base_cmd = f"bash {remote}"
+            if use_sudo:
+                base_cmd = _wrap_sudo(client, base_cmd)
+            cmd = f"{base_cmd}; _rc=$?; rm -f {remote}; exit $_rc"
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout * 12, get_pty=pty)
+            if use_sudo and base_cmd.startswith("sudo"):
+                _sudo_stdin(stdin, info)
+            code = stdout.channel.recv_exit_status()
+            out  = stdout.read().decode("utf-8", errors="replace")
+            err  = "" if pty else stderr.read().decode("utf-8", errors="replace")
     except Exception as e:
         code, out, err = -1, "", str(e)
     finally:
