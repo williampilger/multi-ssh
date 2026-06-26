@@ -3,6 +3,8 @@
 > ⚠️ Aplicativo de terminal desenvolvido com **uso pesado** de geração de código por IA (Claude Code).
 > Embora o código tenha sido revisado e ajustado, use por sua conta e risco.
 
+> ⚠️ Eu uso esse app constantemente em um **Ubuntu 25.01**, então é nesse sistema que ele funciona adequadamente.
+> Em Windows deve funcionar? Sim, deve. Mas, as minhas alterações não são testadas sempre nele para validar.
 
 Execute comandos SSH em múltiplos hosts simultaneamente.
 
